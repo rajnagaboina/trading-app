@@ -1,6 +1,6 @@
 import axios from 'axios'
 import type { Quote, OHLCV, OptionChain } from '@/types'
-import { generateMockQuote, generateMockOptionChain } from './mockData'
+import { generateMockQuote, generateMockOptionChain, generateMockBars, buildOptionChain } from './mockData'
 
 const BASE = 'https://api.polygon.io'
 const WS_BASE = 'wss://socket.polygon.io/stocks'
@@ -81,7 +81,6 @@ export async function fetchBars(
       volume: r.v,
     }))
   } catch {
-    const { generateMockBars } = await import('./mockData')
     return generateMockBars(symbol, 365)
   }
 }
@@ -99,7 +98,6 @@ export async function fetchOptionChain(underlying: string): Promise<OptionChain>
       fetchQuote(underlying),
     ])
 
-    const { buildOptionChain } = await import('./mockData')
     const contracts = snapRes.data.results ?? []
     if (contracts.length === 0) throw new Error('empty')
 
