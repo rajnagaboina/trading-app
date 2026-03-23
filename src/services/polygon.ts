@@ -1,5 +1,6 @@
 import axios from 'axios'
-import type { Quote, OHLCV, OptionChain, OptionContract } from '@/types'
+import type { Quote, OHLCV, OptionChain } from '@/types'
+import { generateMockQuote, generateMockOptionChain } from './mockData'
 
 const BASE = 'https://api.polygon.io'
 const WS_BASE = 'wss://socket.polygon.io/stocks'
@@ -11,29 +12,52 @@ const api = axios.create({
 
 // ── REST ──────────────────────────────────────────────────────────────────────
 
+/**
+ * fetchQuote — uses free-tier endpoints:
+ *   /v2/aggs/ticker/{sym}/prev  → previous day OHLCV (always free)
+ *   /v2/last/trade/{sym}        → last trade price   (free, best-effort)
+ * Falls back to realistic mock data on any error.
+ */
 export async function fetchQuote(symbol: string): Promise<Quote> {
-  const [snap, details] = await Promise.all([
-    api.get(`/v2/snapshot/locale/us/markets/stocks/tickers/${symbol}`),
-    api.get(`/v3/reference/tickers/${symbol}`).catch(() => ({ data: {} })),
-  ])
+  try {
+    const [prevRes, lastRes] = await Promise.allSettled([
+      api.get(`/v2/aggs/ticker/${symbol}/prev`, { params: { adjusted: true } }),
+      api.get(`/v2/last/trade/${symbol}`),
+    ])
 
-  const d = snap.data.ticker
-  return {
-    symbol,
-    price: d.day.c,
-    change: d.day.c - d.prevDay.c,
-    changePercent: ((d.day.c - d.prevDay.c) / d.prevDay.c) * 100,
-    open: d.day.o,
-    high: d.day.h,
-    low: d.day.l,
-    close: d.prevDay.c,
-    volume: d.day.v,
-    avgVolume: d.prevDay.v,
-    marketCap: details.data?.results?.market_cap,
-    timestamp: Date.now(),
+    const prev = prevRes.status === 'fulfilled'
+      ? prevRes.value.data.results?.[0]
+      : null
+
+    if (!prev) return generateMockQuote(symbol)
+
+    const prevClose = prev.c as number
+    const lastPrice = lastRes.status === 'fulfilled'
+      ? (lastRes.value.data.results?.p as number ?? prevClose)
+      : prevClose
+
+    return {
+      symbol,
+      price: lastPrice,
+      change: lastPrice - prevClose,
+      changePercent: ((lastPrice - prevClose) / prevClose) * 100,
+      open: prev.o as number,
+      high: prev.h as number,
+      low: prev.l as number,
+      close: prevClose,
+      volume: prev.v as number,
+      avgVolume: prev.v as number,
+      timestamp: Date.now(),
+    }
+  } catch {
+    return generateMockQuote(symbol)
   }
 }
 
+/**
+ * fetchBars — free tier: historical daily/intraday aggregates (delayed ≥15min).
+ * Falls back to mock bars on error.
+ */
 export async function fetchBars(
   symbol: string,
   multiplier: number,
@@ -41,73 +65,53 @@ export async function fetchBars(
   from: string,
   to: string
 ): Promise<OHLCV[]> {
-  const res = await api.get(
-    `/v2/aggs/ticker/${symbol}/range/${multiplier}/${timespan}/${from}/${to}`,
-    { params: { adjusted: true, sort: 'asc', limit: 50000 } }
-  )
-  return (res.data.results ?? []).map((r: Record<string, number>) => ({
-    time: Math.floor(r.t / 1000),
-    open: r.o,
-    high: r.h,
-    low: r.l,
-    close: r.c,
-    volume: r.v,
-  }))
-}
-
-export async function fetchOptionChain(underlying: string): Promise<OptionChain> {
-  const [snapRes, quoteRes] = await Promise.all([
-    api.get(`/v3/snapshot/options/${underlying}`, {
-      params: { limit: 250, 'contract_type': 'call,put' },
-    }),
-    fetchQuote(underlying),
-  ])
-
-  const contracts: OptionContract[] = (snapRes.data.results ?? []).map(
-    (r: Record<string, unknown>) => {
-      const d = r.details as Record<string, unknown>
-      const g = (r.greeks as Record<string, number>) ?? {}
-      const vol = (r.day as Record<string, number>)?.volume ?? 0
-      const oi = (r.open_interest as number) ?? 1
-      return {
-        symbol: d.ticker as string,
-        underlying,
-        expiry: d.expiration_date as string,
-        strike: d.strike_price as number,
-        type: d.contract_type as 'call' | 'put',
-        bid: (r.last_quote as Record<string, number>)?.bid ?? 0,
-        ask: (r.last_quote as Record<string, number>)?.ask ?? 0,
-        last: (r.last_trade as Record<string, number>)?.price ?? 0,
-        volume: vol,
-        openInterest: oi,
-        iv: (r.implied_volatility as number) ?? 0,
-        greeks: {
-          delta: g.delta ?? 0,
-          gamma: g.gamma ?? 0,
-          theta: g.theta ?? 0,
-          vega: g.vega ?? 0,
-          rho: g.rho ?? 0,
-        },
-        volumeOIRatio: vol / Math.max(oi, 1),
-        isSweep: vol > oi * 3 && vol > 500,
-      }
-    }
-  )
-
-  const ivValues = contracts.map((c) => c.iv).filter(Boolean).sort((a, b) => a - b)
-  const currentIV = ivValues[Math.floor(ivValues.length / 2)] ?? 0
-
-  return {
-    underlying,
-    underlyingPrice: quoteRes.price,
-    ivRank: currentIV * 100, // simplified — real IVRank needs 52-week range
-    ivPercentile: 50,
-    expirations: [...new Set(contracts.map((c) => c.expiry))].sort(),
-    contracts,
+  try {
+    const res = await api.get(
+      `/v2/aggs/ticker/${symbol}/range/${multiplier}/${timespan}/${from}/${to}`,
+      { params: { adjusted: true, sort: 'asc', limit: 50000 } }
+    )
+    const results = res.data.results ?? []
+    if (results.length === 0) throw new Error('empty')
+    return results.map((r: Record<string, number>) => ({
+      time: Math.floor(r.t / 1000),
+      open: r.o,
+      high: r.h,
+      low: r.l,
+      close: r.c,
+      volume: r.v,
+    }))
+  } catch {
+    const { generateMockBars } = await import('./mockData')
+    return generateMockBars(symbol, 365)
   }
 }
 
-// ── WebSocket ─────────────────────────────────────────────────────────────────
+/**
+ * fetchOptionChain — requires Polygon Starter ($29/mo).
+ * Returns mock chain on 403/error so the UI stays functional on free tier.
+ */
+export async function fetchOptionChain(underlying: string): Promise<OptionChain> {
+  try {
+    const [snapRes, quoteRes] = await Promise.all([
+      api.get(`/v3/snapshot/options/${underlying}`, {
+        params: { limit: 250 },
+      }),
+      fetchQuote(underlying),
+    ])
+
+    const { buildOptionChain } = await import('./mockData')
+    const contracts = snapRes.data.results ?? []
+    if (contracts.length === 0) throw new Error('empty')
+
+    return buildOptionChain(underlying, quoteRes.price, contracts)
+  } catch {
+    // Free tier: generate realistic mock option chain
+    const quote = await fetchQuote(underlying)
+    return generateMockOptionChain(underlying, quote.price)
+  }
+}
+
+// ── WebSocket (requires Starter plan) ────────────────────────────────────────
 
 type QuoteHandler = (quote: Partial<Quote> & { symbol: string }) => void
 

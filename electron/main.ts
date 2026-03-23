@@ -1,7 +1,7 @@
 import { app, BrowserWindow, Menu, shell } from 'electron'
 import path from 'path'
 
-const isDev = process.env.NODE_ENV === 'development'
+const isDev = !app.isPackaged
 
 let mainWindow: BrowserWindow | null = null
 

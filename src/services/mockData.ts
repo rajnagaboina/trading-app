@@ -2,7 +2,18 @@
  * Mock data generators for development without a paid API plan.
  * Replace with real endpoints (Unusual Whales, Tradier, Polygon Starter+) in production.
  */
-import type { UOAAlert, OHLCV, VolumeProfileBar } from '@/types'
+import type { UOAAlert, OHLCV, VolumeProfileBar, Quote, OptionChain, OptionContract } from '@/types'
+
+// Realistic seed prices for well-known symbols
+const SEED_PRICES: Record<string, number> = {
+  AAPL: 213, TSLA: 248, NVDA: 875, AMD: 162, SPY: 548,
+  QQQ: 468, AMZN: 198, META: 562, MSFT: 415, GOOGL: 172,
+  IWM: 208, DIA: 422, GLD: 231, TLT: 89, SOXL: 31,
+}
+
+function seedPrice(symbol: string): number {
+  return SEED_PRICES[symbol] ?? 100 + (symbol.charCodeAt(0) % 50) * 3
+}
 
 const SYMBOLS = ['AAPL', 'TSLA', 'NVDA', 'AMD', 'SPY', 'QQQ', 'AMZN', 'META', 'MSFT', 'GOOGL']
 
@@ -60,9 +71,153 @@ function getFutureExpiry(): string {
   return d.toISOString().split('T')[0]
 }
 
+// ── Quote ─────────────────────────────────────────────────────────────────────
+
+export function generateMockQuote(symbol: string): Quote {
+  const base = seedPrice(symbol)
+  const change = (Math.random() - 0.48) * base * 0.02
+  const price = base + change
+  return {
+    symbol,
+    price: +price.toFixed(2),
+    change: +change.toFixed(2),
+    changePercent: +((change / base) * 100).toFixed(2),
+    open: +(base * (1 + (Math.random() - 0.5) * 0.005)).toFixed(2),
+    high: +(Math.max(base, price) * (1 + Math.random() * 0.008)).toFixed(2),
+    low: +(Math.min(base, price) * (1 - Math.random() * 0.008)).toFixed(2),
+    close: base,
+    volume: randInt(20_000_000, 120_000_000),
+    avgVolume: randInt(30_000_000, 90_000_000),
+    timestamp: Date.now(),
+  }
+}
+
+// ── Options Chain ─────────────────────────────────────────────────────────────
+
+export function generateMockOptionChain(underlying: string, underlyingPrice: number): OptionChain {
+  const expirations = getNextExpirations(6)
+  const contracts: OptionContract[] = []
+
+  for (const expiry of expirations) {
+    const daysOut = Math.ceil((new Date(expiry).getTime() - Date.now()) / 86400000)
+    const baseIV = 0.25 + Math.random() * 0.3
+
+    // Generate strikes ±15% around current price in $5 increments
+    const strikeLow = Math.floor(underlyingPrice * 0.85 / 5) * 5
+    const strikeHigh = Math.ceil(underlyingPrice * 1.15 / 5) * 5
+
+    for (let strike = strikeLow; strike <= strikeHigh; strike += 5) {
+      for (const type of ['call', 'put'] as const) {
+        const moneyness = type === 'call'
+          ? underlyingPrice / strike
+          : strike / underlyingPrice
+        const isITM = moneyness > 1
+
+        // IV smile: higher IV for OTM options
+        const ivSmile = baseIV * (1 + Math.max(0, (1 - moneyness) * 2))
+        const iv = Math.min(2.0, ivSmile)
+
+        // Delta approximation
+        const delta = type === 'call'
+          ? Math.min(0.99, Math.max(0.01, isITM ? 0.5 + moneyness * 0.3 : 0.5 - (1 - moneyness) * 2))
+          : Math.min(-0.01, Math.max(-0.99, isITM ? -0.5 - moneyness * 0.3 : -0.5 + (1 - moneyness) * 2))
+
+        // Option price approximation
+        const intrinsic = Math.max(0, type === 'call' ? underlyingPrice - strike : strike - underlyingPrice)
+        const timeValue = underlyingPrice * iv * Math.sqrt(daysOut / 365) * 0.4
+        const mid = +(intrinsic + timeValue).toFixed(2)
+        const spread = Math.max(0.05, mid * 0.04)
+
+        const vol = randInt(10, isITM ? 8000 : 2000)
+        const oi = randInt(vol * 2, vol * 20)
+        const volumeOIRatio = vol / Math.max(oi, 1)
+
+        contracts.push({
+          symbol: `${underlying}${expiry.replace(/-/g, '')}${type === 'call' ? 'C' : 'P'}${String(strike * 1000).padStart(8, '0')}`,
+          underlying,
+          expiry,
+          strike,
+          type,
+          bid: +(mid - spread / 2).toFixed(2),
+          ask: +(mid + spread / 2).toFixed(2),
+          last: mid,
+          volume: vol,
+          openInterest: oi,
+          iv,
+          greeks: {
+            delta: +delta.toFixed(3),
+            gamma: +(0.01 + Math.random() * 0.05).toFixed(4),
+            theta: +(-(timeValue / daysOut) * 0.9).toFixed(3),
+            vega: +(underlyingPrice * 0.01 * Math.sqrt(daysOut / 365)).toFixed(3),
+            rho: +(delta * daysOut * 0.0001).toFixed(4),
+          },
+          volumeOIRatio,
+          isSweep: vol > oi * 0.5 && vol > 500,
+        })
+      }
+    }
+  }
+
+  return {
+    underlying,
+    underlyingPrice,
+    ivRank: randInt(20, 80),
+    ivPercentile: randInt(25, 75),
+    expirations,
+    contracts,
+  }
+}
+
+/** Build OptionChain from raw Polygon API results (used when API succeeds) */
+export function buildOptionChain(underlying: string, underlyingPrice: number, rawContracts: Record<string, unknown>[]): OptionChain {
+  const contracts: OptionContract[] = rawContracts.map((r) => {
+    const d = r.details as Record<string, unknown>
+    const g = (r.greeks as Record<string, number>) ?? {}
+    const vol = (r.day as Record<string, number>)?.volume ?? 0
+    const oi = (r.open_interest as number) ?? 1
+    return {
+      symbol: d.ticker as string,
+      underlying,
+      expiry: d.expiration_date as string,
+      strike: d.strike_price as number,
+      type: d.contract_type as 'call' | 'put',
+      bid: (r.last_quote as Record<string, number>)?.bid ?? 0,
+      ask: (r.last_quote as Record<string, number>)?.ask ?? 0,
+      last: (r.last_trade as Record<string, number>)?.price ?? 0,
+      volume: vol,
+      openInterest: oi,
+      iv: (r.implied_volatility as number) ?? 0,
+      greeks: { delta: g.delta ?? 0, gamma: g.gamma ?? 0, theta: g.theta ?? 0, vega: g.vega ?? 0, rho: g.rho ?? 0 },
+      volumeOIRatio: vol / Math.max(oi, 1),
+      isSweep: vol > oi * 3 && vol > 500,
+    }
+  })
+  const ivValues = contracts.map((c) => c.iv).filter(Boolean).sort((a, b) => a - b)
+  const currentIV = ivValues[Math.floor(ivValues.length / 2)] ?? 0
+  return {
+    underlying, underlyingPrice,
+    ivRank: currentIV * 100,
+    ivPercentile: 50,
+    expirations: [...new Set(contracts.map((c) => c.expiry))].sort(),
+    contracts,
+  }
+}
+
+function getNextExpirations(count: number): string[] {
+  const exps: string[] = []
+  const d = new Date()
+  while (exps.length < count) {
+    d.setDate(d.getDate() + 1)
+    if (d.getDay() === 5) exps.push(d.toISOString().split('T')[0])
+  }
+  return exps
+}
+
+// ── Bars ──────────────────────────────────────────────────────────────────────
+
 export function generateMockBars(symbol: string, days = 365): OHLCV[] {
   const bars: OHLCV[] = []
-  let price = { AAPL: 185, TSLA: 250, NVDA: 800, SPY: 530, QQQ: 460 }[symbol] ?? 100
+  let price = seedPrice(symbol)
   const now = Math.floor(Date.now() / 1000)
   const DAY = 86400
 
